@@ -1,0 +1,7 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite -signatures;
+
+plugin 'Config';
+plugin 'ProxyPass';
+
+app->proxy->pass->start;

@@ -1,0 +1,13 @@
+{
+  hypnotoad => {
+    listen => ['http://*:3000'],
+    workers => 4,
+  },
+  proxy_pass => {
+    uds_path => '/var/mojo/unixsockets',
+    upstream => {
+      'example.com' => 'http://1.2.3.4',
+      'www.example.com' => 'http://1.2.3.4',
+    },
+  },
+}
