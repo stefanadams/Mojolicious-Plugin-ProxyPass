@@ -22,6 +22,7 @@ sub register {
   $self->can($_) and $self->$_(/_path$/ && $config->{$_} ? path($config->{$_}) : $config->{$_}) for keys %$config;
   push @{$app->renderer->classes}, __PACKAGE__, 'ProxyPass::Controller::ProxyPass';
 
+  $app->plugin('HeaderCondition');
   $app->hook(before_server_start => sub ($server, $app) {
     warn sprintf "Unix Domain Socket Path is %s\n", $self->uds_path if $self->uds_path;
   });
@@ -51,6 +52,9 @@ sub register {
 
   $app->helper('proxy.pass' => sub ($c, $req_cb=undef, $res_cb=undef) {
     my $r = $app->routes;
+    $r->add_condition(proxy_pass => sub ($oroute, $c, $captures, $undef) {
+      return $c->proxy->upstream ? 1 : undef;
+    });
     my $pp = $r->under('/proxypass');
     $pp->any('/login')->to('proxy_pass#login', namespace => 'ProxyPass::Controller')->name('proxy_pass_login');
     $pp->any('/logout')->to('proxy_pass#logout', namespace => 'ProxyPass::Controller')->name('proxy_pass_logout');
@@ -61,7 +65,8 @@ sub register {
       return 1 unless grep { $_ eq $upstream->host_port } @$auth_upstream;
       $c->proxy->auth($upstream, $auth_upstream);
     });
-    $up->any('/*whatever' => {whatever => ''} => sub { $self->_proxy_pass(shift, $req_cb, $res_cb) });
+    $up->any('/*proxy_pass' => {proxy_pass => ''} => sub { $self->_proxy_pass(shift, $req_cb, $res_cb) })
+       ->requires('proxy_pass');
     return $app;
   });
 
