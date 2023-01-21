@@ -8,7 +8,7 @@ use ProxyPass::JWT;
 
 use constant DEBUG => $ENV{MOJO_PROXY_DEBUG} //= 0;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 has default_url => 'http://example.com';
 has jwt => sub { ProxyPass::JWT->new };

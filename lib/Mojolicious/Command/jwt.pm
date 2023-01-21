@@ -9,7 +9,11 @@ sub run {
 
   die $self->usage unless @_ == 2;
 
-  say $app->proxy->jwt->url(@_);
+  my ($url, $id) = @_;
+  my $jwt = $app->proxy->jwt;
+  my $token = $jwt->token($id, 600);
+
+  say $jwt->url($url, $token);
 }
 
 1;
