@@ -52,15 +52,19 @@ sub register {
 
   $app->helper('proxy.pass' => sub ($c, $req_cb=undef, $res_cb=undef) {
     my $r = $app->routes;
-    $r->add_condition(proxy_pass => sub ($oroute, $c, $captures, $undef) {
-      return $c->proxy->upstream ? 1 : undef;
+    $r->add_condition(proxy_pass => sub ($route, $c, $captures, $undef) {
+      return 1 if $c->proxy->upstream;
+      my $error = sprintf 'Configuration for upstream %s not found', $c->tx->req->headers->host;
+      $c->log->trace($error);
+      $c->stash(upstream_error => $error);
+      return undef;
     });
     my $pp = $r->under('/proxypass');
     $pp->any('/login')->to('proxy_pass#login', namespace => 'ProxyPass::Controller')->name('proxy_pass_login');
     $pp->any('/logout')->to('proxy_pass#logout', namespace => 'ProxyPass::Controller')->name('proxy_pass_logout');
     my $up = $r->under(sub ($c) {
       $c->tx->req->headers->host or return $c->proxy->error(400 => 'Host missing from HTTP request');
-      my $upstream = $c->proxy->upstream or return $c->proxy->error(400 => sprintf 'Upstream for %s not found', $c->tx->req->headers->host);
+      my $upstream = $c->proxy->upstream or return $c->proxy->error(400 => sprintf 'Configuration for upstream %s not found', $c->tx->req->headers->host);
       my $auth_upstream = $config->{auth_upstream} || [];
       return 1 unless grep { $_ eq $upstream->host_port } @$auth_upstream;
       $c->proxy->auth($upstream, $auth_upstream);
@@ -140,8 +144,9 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
 
   # Start non-blocking request
   $c->proxy->start_p($or_tx)->catch(sub ($err) {
-    $c->log->error(sprintf 'Proxy error connecting to backend %s from %s: %s', $or_req_url->host_port, $gw_req_url->host_port, $err);
-    $c->proxy->error(400 => 'Could not connect to backend web service!');
+    my $error = sprintf 'Proxy error connecting to backend %s from %s: %s', $or_req_url->host_port, $gw_req_url->host_port, $err;
+    $c->log->error($error);
+    $c->proxy->error(400 => $self->app->mode eq 'development' ? $error : 'Could not connect to backend web service!');
   });
 
   # Modify origin response
@@ -184,6 +189,7 @@ sub _resume ($c, $gw_tx, $or_tx) {
 
 sub _trace {
   my ($c, $msg) = (shift, shift);
+  return unless @_;
   my ($name) = ($msg =~ /^(\w+)/);
   if (my $username = $c->stash($name)) {
     $c->log->trace(sprintf "[%s] $msg", $username, @_);
@@ -330,10 +336,3 @@ Set to a true value to enable gateway and origin request and response logging.
 L<Mojolicious>, L<Mojolicious::Guides>, L<https://mojolicious.org>.
 
 =cut
-
-__DATA__
-@@ not_found.development.html.ep
-404
-
-@@ exception.development.html.ep
-500: <%= $exception->message %>
