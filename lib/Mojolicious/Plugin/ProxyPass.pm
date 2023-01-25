@@ -40,7 +40,15 @@ sub register {
 
   $app->helper('proxy.error' => sub ($c, $status, $message) {
     $c->log->error($message);
-    $c->render(status => $status, text => $message);
+    if ($status =~ /^4/) {
+      $c->reply->not_found;
+    }
+    elsif ($status =~ /^5/) {
+      $c->reply->exception($message);
+    }
+    else {
+      $c->reply->exception($message);
+    }
     return undef;
   });
 
