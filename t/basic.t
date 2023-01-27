@@ -63,16 +63,16 @@ subtest 'Various response variants' => sub {
   $t->get_ok('/size/200/1')->status_is(200)->header_is('X-Mojo-App' => 'Size')->header_is('Content-Length' => 1)->content_is('x');
   $t->get_ok('/size/200/0')->status_is(200)->header_is('X-Mojo-App' => 'Size')->header_is('Content-Length' => 0)->content_is('');
   $t->get_ok('/size/204/0')->status_is(204)->header_is('X-Mojo-App' => 'Size')->header_is('Content-Length' => undef)->content_is('');
-  $t->get_ok('/redirect/304/200/1')->status_is(304)->header_is('Location' => $gw_url->path('/size/200/1')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => undef)->content_is('');
-  $t->get_ok('/redirect/302/200/1')->status_is(302)->header_is('Location' => $gw_url->path('/size/200/1')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
-  $t->get_ok('/redirect/301/200/1')->status_is(301)->header_is('Location' => $gw_url->path('/size/200/1')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
-  $t->get_ok('/redirect/304/200/0')->status_is(304)->header_is('Location' => $gw_url->path('/size/200/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => undef)->content_is('');
-  $t->get_ok('/redirect/302/200/0')->status_is(302)->header_is('Location' => $gw_url->path('/size/200/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
-  $t->get_ok('/redirect/301/200/0')->status_is(301)->header_is('Location' => $gw_url->path('/size/200/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
-  $t->get_ok('/redirect/304/204/0')->status_is(304)->header_is('Location' => $gw_url->path('/size/204/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => undef)->content_is('');
-  $t->get_ok('/redirect/302/204/0')->status_is(302)->header_is('Location' => $gw_url->path('/size/204/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
-  $t->get_ok('/redirect/301/204/0')->status_is(301)->header_is('Location' => $gw_url->path('/size/204/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
-  $t->get_ok('/redirect/301/200/0/http%3A%2F%2Fhost%3A8080%2Fpath')->status_is(301)->header_is('Location' => $gw_url->path('/size/200/0/http%3A%2F%2Fhost%3A8080%2Fpath')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
+  $t->get_ok('/redirect/304/200/1')->status_is(304)->header_is('Location' => $or_url->path('/size/200/1')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => undef)->content_is('');
+  $t->get_ok('/redirect/302/200/1')->status_is(302)->header_is('Location' => $or_url->path('/size/200/1')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
+  $t->get_ok('/redirect/301/200/1')->status_is(301)->header_is('Location' => $or_url->path('/size/200/1')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
+  $t->get_ok('/redirect/304/200/0')->status_is(304)->header_is('Location' => $or_url->path('/size/200/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => undef)->content_is('');
+  $t->get_ok('/redirect/302/200/0')->status_is(302)->header_is('Location' => $or_url->path('/size/200/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
+  $t->get_ok('/redirect/301/200/0')->status_is(301)->header_is('Location' => $or_url->path('/size/200/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
+  $t->get_ok('/redirect/304/204/0')->status_is(304)->header_is('Location' => $or_url->path('/size/204/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => undef)->content_is('');
+  $t->get_ok('/redirect/302/204/0')->status_is(302)->header_is('Location' => $or_url->path('/size/204/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
+  $t->get_ok('/redirect/301/204/0')->status_is(301)->header_is('Location' => $or_url->path('/size/204/0')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
+  $t->get_ok('/redirect/301/200/0/http%3A%2F%2Fhost%3A8080%2Fpath')->status_is(301)->header_is('Location' => $or_url->path('/size/200/0/http%3A%2F%2Fhost%3A8080%2Fpath')->to_string)->header_is('X-Mojo-App' => 'Redirect')->header_is('Content-Length' => 0)->content_is('');
 };
 
 done_testing();
