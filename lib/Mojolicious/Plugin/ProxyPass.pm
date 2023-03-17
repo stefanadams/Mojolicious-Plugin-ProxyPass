@@ -147,7 +147,6 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
 
   # Modify origin request
   $or_tx->req->content($gw_req->content);
-  $or_tx->req->headers->header('Host'              => $c->proxy->upstream->host_port);
   $or_tx->req->headers->header('X-Forwarded-For'   => $gw_tx->remote_address);
   $or_tx->req->headers->header('X-Forwarded-Host'  => $gw_req_url->host_port);
   $or_tx->req->headers->header('X-Forwarded-Proto' => $gw_req_url->scheme);
