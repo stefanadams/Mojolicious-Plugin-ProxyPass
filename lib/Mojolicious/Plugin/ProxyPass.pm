@@ -114,7 +114,19 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
   $or_req_url->host or return $c->proxy->error(400 => sprintf 'Upstream for %s not found', $gw_req_url->host_port);
 
   # Build origin transaction
-  my $or_tx = $c->ua->build_tx($or_req_method => $or_req_url => $or_req_headers->to_hash);
+  my $or_tx;
+  if ($gw_tx->is_websocket) {
+    $or_req_url->scheme('ws');
+    $c->log->trace(sprintf 'websocket! %s', $or_req_url);
+    $or_tx = $c->ua->build_websocket_tx($or_req_url => $or_req_headers->to_hash);
+    $c->on(message => sub ($c, $msg) {
+      $c->log->trace(sprintf 'websocket!!! %s', $msg);
+      $c->send($msg);
+    });
+  }
+  else {
+    $or_tx = $c->ua->build_tx($or_req_method => $or_req_url => $or_req_headers->to_hash);
+  }
 
   # Modify origin request
   $or_tx->req->content($gw_req->content);
