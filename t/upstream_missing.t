@@ -1,18 +1,6 @@
-package Test::MockTime;
-our $offset = 0;
-BEGIN {
-  *CORE::GLOBAL::time = \&Test::MockTime::time;
-}
-sub time() { return ( CORE::time + $offset ) }
-sub set_relative_time { return $offset = $_[-1] };
-
-package main;
 use Mojo::Base -strict, -signatures;
 
-BEGIN {
-  $ENV{MOJO_LOG_LEVEL} = 'error';
-  $ENV{MOJO_REACTOR}  = 'Mojo::Reactor::Poll';
-}
+BEGIN { $ENV{MOJO_REACTOR} = 'Mojo::Reactor::Poll' }
 
 use Test::More;
 use Test::Mojo;
@@ -58,44 +46,19 @@ $or_r->get('/*all' => {all=>''} => sub ($c) {
 });
 
 my $t = Test::Mojo->new;
-$t->app->log->path('/dev/null');
 my $gw_url = $t->ua->server->url->to_abs;
 
 plugin 'ProxyPass' => {
-  auth_upstream => [$or_url->host_port],
-  upstream => {
-    $gw_url->host_port => $or_url->host_port,
-  },
+  uds_path => undef,
 };
 
-app->helper('proxy.login' => sub ($c) {
-  my $jwt = $c->param('proxypass') or return;
-  return $c->proxy->jwt->id($jwt);
-});
-
 app->proxy->pass;
+get '/*whatever' => sub ($c) {
+  $c->render(text => $c->stash('upstream_error'), status => 404) if $c->stash('upstream_error');
+};
 
-subtest 'Various response variants' => sub {
-  $t->get_ok('/size/200/2')->status_is(302, 'requires login');
-  $t->get_ok('/proxypass/login')->status_is(200, 'redirected to login');
-  $t->get_ok('/size/200/2')->status_isnt(200, 'requires login');
-  $t->get_ok('/proxypass/login?proxypass=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJQcm94eVBhc3MiOiJhIiwiZXhwIjoxNjcwODE3NTE2fQ.oIl1alsXTh3-Uag8Q2Nc09V4Tq5EZDpT3bWcDZ4MFbI')->status_is(500, 'failed HS validation');
-  $t->get_ok('/size/200/2')->status_isnt(200, 'requires login');
-
-  my $token = app->proxy->jwt->token('a');
-  my $expires = app->proxy->jwt->jwt->decode($token)->{exp};
-  my $url = app->proxy->jwt->url('/proxypass/login', $token);
-
-  ok time < $expires, 'time is not expired';
-  $t->get_ok($url)->status_is(200, 'logged in');
-  $t->get_ok('/size/200/2')->status_is(200, 'got proxied page');
-
-  $t->reset_session and Test::MockTime::set_relative_time(610);
-  is time - CORE::time, 610, '"slept" 610 seconds';
-
-  ok time > $expires, 'time is expired';
-  $t->get_ok($url)->status_is(500, 'JWT has expired (after mocked time adjustment)');
-  $t->get_ok('/size/200/2')->status_is(302, 'requires login');
+subtest 'Upstream Missing' => sub {
+  $t->get_ok('/size/200/2')->status_is(404)->header_isnt('X-Mojo-App' => 'Size')->content_like(qr(Configuration for upstream 127.0.0.1:\d+ not found), 'upstream not found');
 };
 
 done_testing();
