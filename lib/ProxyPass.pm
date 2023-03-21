@@ -21,11 +21,13 @@ has resources => sub ($self) {
 };
 
 sub find ($self, $url) {
+  return c() unless $url->to_abs->host_port;
   $self->resources->grep(sub { _grep_url($url->clone) })
   #->tap(sub{$_->dump for @$_})
 }
 
 sub _grep_url ($url) {
+  return unless $_->downstream->host_port;
   $_->downstream->host_port eq $url->to_abs->host_port &&
   $url->path->trailing_slash(0)->contains($_->downstream->path->trailing_slash(0))
 }

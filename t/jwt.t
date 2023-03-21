@@ -2,6 +2,9 @@ package Test::MockTime;
 our $offset = 0;
 BEGIN {
   *CORE::GLOBAL::time = \&Test::MockTime::time;
+  $ENV{MOJO_REACTOR} = 'Mojo::Reactor::Poll';
+  $ENV{PROXYPASS_DEBUG} //= 0;
+  $ENV{PROXYPASS_LOG_LEVEL} //= 'info';
 }
 sub time() { return ( CORE::time + $offset ) }
 sub set_relative_time { return $offset = $_[-1] };

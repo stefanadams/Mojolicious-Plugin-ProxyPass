@@ -1,6 +1,10 @@
 use Mojo::Base -strict, -signatures;
 
-BEGIN { $ENV{MOJO_REACTOR} = 'Mojo::Reactor::Poll' }
+BEGIN {
+  $ENV{MOJO_REACTOR} = 'Mojo::Reactor::Poll';
+  $ENV{PROXYPASS_DEBUG} //= 0;
+  $ENV{PROXYPASS_LOG_LEVEL} //= 'info';
+}
 
 use Test::More;
 use Test::Mojo;

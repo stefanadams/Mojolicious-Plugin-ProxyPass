@@ -2,90 +2,68 @@ package Mojolicious::Plugin::ProxyPass;
 use Mojo::Base 'Mojolicious::Plugin', -signatures;
 
 use Mojo::File qw(path tempdir);
+use Mojo::Loader qw(load_class);
+use Mojo::MemoryMap;
 use Mojo::URL;
 use ProxyPass;
 use ProxyPass::JWT;
 
-use constant DEBUG => $ENV{MOJO_PROXY_DEBUG} //= 0;
+use constant DEBUG => $ENV{PROXYPASS_DEBUG} //= 0;
+use constant LOG_LEVEL => $ENV{PROXYPASS_LOG_LEVEL} //= 'trace';
 
-our $VERSION = '0.03';
+our $VERSION = '0.05';
 
-has default_url => 'http://example.com';
+has controller => 'ProxyPass';
 has jwt => sub { ProxyPass::JWT->new };
-has uds_path => sub { $ENV{MOJO_PROXY_UDS_PATH} ? path($ENV{MOJO_PROXY_UDS_PATH})->make_path : tempdir };
+has namespace => 'ProxyPass::Controller';
+has uds_path => sub { $ENV{PROXYPASS_UDS_PATH} ? path($ENV{PROXYPASS_UDS_PATH})->make_path : undef };
 has upstream => sub { {} };
 
-sub register {
-  my ($self, $app, $config) = @_;
+sub register ($self, $app, $config) {
 
-  $config = $app->config('proxy_pass') || {} unless keys %$config;
-  $self->can($_) and $self->$_(/_path$/ && $config->{$_} ? path($config->{$_}) : $config->{$_}) for keys %$config;
-  push @{$app->renderer->classes}, __PACKAGE__, 'ProxyPass::Controller::ProxyPass';
-
+  # Initialize plugin
+  $self->_initialize($app, $config);
   $app->plugin('HeaderCondition');
-  $app->hook(before_server_start => sub ($server, $app) {
-    warn sprintf "Unix Domain Socket Path is %s\n", $self->uds_path if $self->uds_path;
-  });
+  $app->hook(before_server_start => sub { _before_server_start($self, @_) });
+  $app->hook(before_dispatch => sub { _before_dispatch($self, @_) });
+  $app->helper('proxy.error' => \&_error);
+  $app->helper('proxy.jwt' => sub { state $jwt = $self->jwt });
+  $app->helper('proxy.log' => \&_log);
+  $app->helper('proxy.login' => \&_login);
+  $app->helper('proxy.pass' => sub { _catch_all($self, @_); $app });
+  $app->helper('proxy.upstream' => sub { _upstream($self, @_) });
 
-  $app->helper('proxy.auth' => sub ($c, $upstream, $auth_upstream) {
-    if (my $id = $c->session('ProxyPass')) {
-      push @{$c->log->{context}}, "[$id]";
-      return 1;
-    }
-    $c->redirect_to($c->url_for('proxy_pass_login')->query(_URL => $c->req->url->to_abs->to_string));
-    return undef;
-  });
-
-  $app->helper('proxy.default_url' => sub ($c) { $self->default_url });
-
-  $app->helper('proxy.error' => sub ($c, $status, $message) {
-    $c->log->error($message);
-    if ($status =~ /^4/) {
-      $c->reply->not_found;
-    }
-    elsif ($status =~ /^5/) {
-      $c->reply->exception($message);
-    }
-    else {
-      $c->reply->exception($message);
-    }
-    return undef;
-  });
-
-  $app->helper('proxy.jwt' => sub ($c) { state $jwt = $self->jwt });
-
-  $app->helper('proxy.login' => sub { 1 });
-
-  $app->helper('proxy.logout' => sub { 1 });
-
-  $app->helper('proxy.pass' => sub ($c, $req_cb=undef, $res_cb=undef) {
-    my $r = $app->routes;
-    $r->add_condition(proxy_pass => sub ($route, $c, $captures, $undef) {
-      return 1 if $c->proxy->upstream;
-      my $error = sprintf 'Configuration for upstream %s not found', $c->tx->req->headers->host;
-      $c->log->trace($error);
-      $c->stash(upstream_error => $error);
-      return undef;
-    });
-    my $pp = $r->under('/proxypass');
-    $pp->any('/login')->to('proxy_pass#login', namespace => 'ProxyPass::Controller')->name('proxy_pass_login');
-    $pp->any('/logout')->to('proxy_pass#logout', namespace => 'ProxyPass::Controller')->name('proxy_pass_logout');
-    my $up = $r->under(sub ($c) {
-      $c->tx->req->headers->host or return $c->proxy->error(400 => 'Host missing from HTTP request');
-      my $upstream = $c->proxy->upstream or return $c->proxy->error(400 => sprintf 'Configuration for upstream %s not found', $c->tx->req->headers->host);
-      my $auth_upstream = $config->{auth_upstream} || [];
-      return 1 unless grep { $_ eq $upstream->host_port } @$auth_upstream;
-      $c->proxy->auth($upstream, $auth_upstream);
-    });
-    $up->any('/*proxy_pass' => {proxy_pass => ''} => sub { $self->_proxy_pass(shift, $req_cb, $res_cb) })
-       ->requires('proxy_pass');
-    return $app;
-  });
-
-  $app->helper('proxy.upstream' => sub ($c, $url=undef) { $self->_upstream($url||$c->tx->req->url) });
+  # Setup ProxyPass routing
+  my $r = $app->routes->add_condition(upstream => \&_requires_upstream);
+  my $pp = $r->under('/proxypass')->to(namespace => $self->namespace, controller => $self->controller, cb => sub { 1 });
+  $pp->get('/')->to('#proxypass', map => $self->{map})->name('proxypass');
+  $pp->any('/login')->to('#login')->name('proxypass_login');
+  $pp->any('/logout')->to('#logout')->name('proxypass_logout');
 
   return $self;
 }
+
+sub _before_dispatch ($self, $c) {
+  return $c->proxy->error(400 => sprintf 'Host missing from HTTP request: %s', $c->tx->req->url->to_abs) unless $c->tx->req->headers->host;
+}
+
+sub _before_server_start ($self, $server, $app) {
+  warn sprintf "Unix Domain Socket Path is %s\n", $self->uds_path if DEBUG && $self->uds_path;
+}
+
+sub _catch_all ($self, $c, $req_cb=undef, $res_cb=undef) {
+  my $up = $c->app->routes->under->to(namespace => $self->namespace, controller => $self->controller, action => 'auth_upstream', config => $self->{config});
+  $up->any('/*proxy_pass' => {proxy_pass => ''} => sub { $self->_proxy_pass(shift, $req_cb, $res_cb) })
+      ->requires('upstream');
+}
+
+sub _config ($self, $app_config, $plugin_config) {
+  my $config = {%$app_config, %$plugin_config};
+  $self->can($_) and $self->$_(/_path$/ && $config->{$_} ? path($config->{$_}) : $config->{$_}) for keys %$config;
+  return $self->{config} = $config;
+}
+
+sub _cx { substr(shift->connection, 0, 7) }
 
 sub _debug ($label, $msg) {
   return unless DEBUG;
@@ -109,11 +87,66 @@ sub _debug ($label, $msg) {
   }
 }
 
+sub _error ($c, $status, $message) {
+  $c->proxy->log->trace($message) if DEBUG;
+  $c->stash('proxy.error' => $message);
+  return if $status == 100;
+  if ($status =~ /^4/) {
+    $c->reply->not_found;
+  }
+  elsif ($status =~ /^5/) {
+    $c->reply->exception($message);
+  }
+  else {
+    $c->reply->exception($message);
+  }
+  return undef;
+}
+
+sub _initialize ($self, $app, $config) {
+  $config = $self->_config($app->config->{proxy_pass} || {}, $config);
+  my $controller_class = join '::', $self->namespace, $self->controller;
+  load_class $controller_class and $app->warmup;
+  push @{$app->renderer->classes}, $controller_class;
+  $self->{connections} = {};
+
+  # Initialize and refresh cache
+  my $map = $self->{map} = Mojo::MemoryMap->new($config->{size});
+  $map->writer->store({connections => {}});
+  Mojo::IOLoop->recurring(5 => sub { $self->_memory_map });
+
+  return $self;
+}
+
+sub _log ($c, @contexts) {
+  my $log = $c->stash('proxy_pass.log');
+  if (!$log || @contexts) {
+    unshift @contexts, $c->req->request_id;
+    unshift @contexts, $c->session('ProxyPass') if $c->session('ProxyPass');
+    $log = $c->app->log->context(sprintf join(' ', map { '[%s]' } @contexts), @contexts);
+    $log->level(LOG_LEVEL);
+    $c->stash('proxy_pass.log' => $log);
+  }
+  return $log;
+}
+
+sub _login ($c) { $c->session('ProxyPass') || $c->req->request_id }
+
+sub _memory_map { $_[0]->{map}->writer->change(sub { $_->{connections}{$$} = [keys $_[0]->{connections}->%*] }) }
+
 sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
   $c->ua->cookie_jar->empty;
+  $c->inactivity_timeout(300);
+  if (my $id = $c->app->proxy->login) {
+    $c->session('ProxyPass' => $id) unless $c->session('ProxyPass');
+  }
+  $c->proxy->log;
+  my $config = $self->{config};
+
   # gateway (gw) is the public-facing reverse proxy server
   my $gw_c           = $c;
   my $gw_tx          = $gw_c->tx;
+  my $gw_ws          = $gw_tx if $gw_tx->is_websocket;
   my $gw_req         = $gw_tx->req;
   my $gw_req_headers = $gw_req->headers;
   my $gw_req_method  = $gw_req->method;
@@ -130,19 +163,24 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
   my $or_req_url     = $c->proxy->upstream;
   $or_req_url->host or return $c->proxy->error(400 => sprintf 'Upstream for %s not found', $gw_req_url->host_port);
 
+  # Handle static files on behalf of the upstream
+  my $key = join '', $c->tx->req->headers->host, $c->tx->req->url->path;
+  if (my ($static_path) = map { $config->{static}->{$_} } grep { $key =~ $_ } keys $config->{static}->%*) {
+    my $static_file = path($static_path, $c->tx->req->url->path);
+    return -e $static_file ? $c->reply->file($static_file) : $c->reply->not_found;
+  }
+
   # Build origin transaction
-  my $or_tx;
+  my ($or_tx, $agent);
   if ($gw_tx->is_websocket) {
-    $or_req_url->scheme('ws');
-    $c->log->trace(sprintf 'websocket! %s', $or_req_url);
+    $or_req_url->scheme($or_req_url->scheme =~ s/http/ws/r);
+    _trace($c, 'ProxyPassWS  !  (%s)', $gw_tx->connection);
     $or_tx = $c->ua->build_websocket_tx($or_req_url => $or_req_headers->to_hash);
-    $c->on(message => sub ($c, $msg) {
-      $c->log->trace(sprintf 'websocket!!! %s', $msg);
-      $c->send($msg);
-    });
+    $agent = 'ua';
   }
   else {
     $or_tx = $c->ua->build_tx($or_req_method => $or_req_url => $or_req_headers->to_hash);
+    $agent = 'proxy';
   }
 
   # Modify origin request
@@ -159,14 +197,46 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
   $req_cb->($c, $or_tx) if ref $req_cb eq 'CODE';
 
   # Log origin request
-  _trace($c, 'ProxyPass >>> %s', $or_req_url);
+  _trace($c, 'ProxyPass >>> %s', join '', path($or_req_url->host)->basename, $or_req_url->path);
   _debug(or => $or_tx->req);
 
+  # Handle downstream websocket messages
+  $gw_c->on(message => sub ($c, $msg) {
+    my $or_ws = $self->{connections}->{$or_tx->connection};
+    _trace($c, 'ProxyPassWS  >  (%s)', _cx($gw_ws));
+    _trace($c, 'ProxyPassWS >>> (%s)', _cx($or_ws));
+    $or_ws->send($msg);
+  });
+  $gw_c->on(finish => sub ($c, $code=undef, $reason=undef) {
+    return unless $c->tx->is_websocket;
+    _trace($c, 'ProxyPassWS !x! (%d|%s)', $code, _cx($gw_ws));
+    delete $self->{connections}->{$or_tx->connection};
+  });
+
   # Start non-blocking request
-  $c->proxy->start_p($or_tx)->catch(sub ($err) {
+  $c->$agent->start_p($or_tx)->then(sub ($tx=undef) {
+    return unless $tx && $tx->is_websocket;
+
+    # Start new websocket connection
+    my $or_ws = $self->{connections}->{$tx->connection} = $tx;
+    _trace($c, 'ProxyPass  !  (%s)', _cx($or_ws));
+    my $stream = Mojo::IOLoop->stream($or_ws->connection // '');
+    $stream->timeout(300) if $stream;
+
+    # Handle upstream websocket messages
+    $or_ws->on(message => sub ($ws, $msg) {
+      _trace($c, 'ProxyPassWS <<< (%s)', _cx($or_ws));
+      _trace($c, 'ProxyPassWS  <  (%s)', _cx($gw_ws));
+      $gw_ws->send($msg);
+    });
+    $or_ws->on(finish => sub ($ws, $code, $reason) {
+      _trace($c, 'ProxyPassWS !X! (%d|%s)', $code, _cx($or_ws));
+      $gw_ws->finish;
+    });
+  })->catch(sub ($err) {
+    _trace($c, 'ProxyPass >>X %s', $gw_req_url->host_port);
     my $error = sprintf 'Proxy error connecting to backend %s from %s: %s', $or_req_url->host_port, $gw_req_url->host_port, $err;
-    $c->log->error($error);
-    $c->proxy->error(400 => $self->app->mode eq 'development' ? $error : 'Could not connect to backend web service!');
+    $c->proxy->error(400 => $c->app->mode eq 'development' ? $error : 'Could not connect to backend web service!');
   });
 
   # Modify origin response
@@ -207,21 +277,34 @@ sub _resume ($c, $gw_tx, $or_tx) {
   return 'X';
 }
 
+sub _requires_upstream ($route, $c, $captures, $undef) {
+  return 1 if $c->proxy->upstream;
+  $c->proxy->error(100 => sprintf 'skip ProxyPass: configuration for upstream %s not found (HTTP/%s)', $c->tx->req->headers->host, $c->tx->req->version);
+  return undef;
+}
+
 sub _trace {
   my ($c, $msg) = (shift, shift);
+  @_ = grep { defined } @_;
   return unless @_;
   my ($name) = ($msg =~ /^(\w+)/);
   if (my $username = $c->stash($name)) {
-    $c->log->trace(sprintf "[%s] $msg", $username, @_);
+    $c->proxy->log->trace(sprintf "[%s] $msg", $username, @_);
   }
   else {
-    $c->log->trace(sprintf $msg, @_);
+    $c->proxy->log->trace(sprintf $msg, @_);
   }
 };
 
-sub _upstream ($self, $url) {
+sub _upstream ($self, $c, $url=undef) {
+  $url ||= $c->tx->req->url;
+  my $upstream = $c->stash("proxy.upstream.$url");
+  return $upstream if $upstream;
   my $proxypass = ProxyPass->new(uds_path => $self->uds_path, config => $self->upstream)->find($url)->first or return;
-  $proxypass->proxypass($url);
+  $upstream = $proxypass->proxypass($url);
+  $c->proxy->log->trace(sprintf 'configuration for upstream %s found: %s', $url, $upstream) if DEBUG;
+  $c->stash("proxy.upstream.$url" => $upstream);
+  return $upstream;
 }
 
 1;
@@ -239,6 +322,10 @@ Mojolicious::Plugin::ProxyPass - Mojolicious Plugin to provide provide reverse p
 
   # Mojolicious::Lite
   plugin 'ProxyPass' => {
+    auth_upstream => ['127.0.0.1:3000'],
+    static => {
+      '127.0.0.1/path' => '/static/path',
+    },
     uds_path => tempdir,
     upstream => {
       '127.0.0.1' => '127.0.0.1:3000'
@@ -247,41 +334,42 @@ Mojolicious::Plugin::ProxyPass - Mojolicious Plugin to provide provide reverse p
 
 =head1 DESCRIPTION
 
-L<Mojolicious::Plugin::ProxyPass> is a L<Mojolicious> plugin to provide reverse proxy functionality.
+L<Mojolicious::Plugin::ProxyPass> is a L<Mojolicious> plugin to provide reverse proxy functionality for any HTTP
+traffic, including support for websockets.  Extensible authentication allows configured upstreams to first require
+authentication.
 
 =head1 ATTRIBUTES
 
 L<Mojolicious::Plugin::ProxyPass> implements the following attributes.
 
-=head2 jwt_secret
+=head2 controller
 
-  my $secret = $proxy_pass->jwt_secret;
-  $c         = $proxy_pass->jwt_secret($secret);
+  my $secret = $proxy_pass->controller;
+  $c         = $proxy_pass->controller($name);
 
-Set the JWT secret, defaults to __FILE__.
+Name of controller relative to L</"namespace"> for internal /proxypass routes, defaults to ProxyPass.
 
-=head2 jwt_timeout
+=head2 jwt
 
-  my $seconds = $proxy_pass->jwt_timeout;
-  $c          = $proxy_pass->jwt_timeout($second);
+  my $secret = $proxy_pass->jwt;
+  $c         = $proxy_pass->jwt($jwt);
 
-Set the JWT timeout value in seconds, defaults to 600 (10 minutes).
+JWT object to optionally use for ProxyPass authentciation, defaults to a new L<ProxyPass::JWT> instance.
 
-=head2 jwt_upstream
+=head2 namespace
 
-  my $upstream = $proxy_pass->jwt_upstream;
-  $c           = $proxy_pass->jwt_upstream([@upstream]);
+  my $secret = $proxy_pass->namespace;
+  $c         = $proxy_pass->namespace($namespace);
 
-Set the upstream hosts that require signed transactions, defaults to an empty list.
-
-Undefine to completely disable JWT support.
+Namespace for internal /proxypass routes controller, defaults to ProxyPass::Controller.
 
 =head2 uds_path
 
   my $path = $proxy_pass->uds_path;
   $c       = $proxy_pass->uds_path($path);
 
-Set the L<Mojo::File/"path"> to where unix domain sockets are stored.
+Set the L<Mojo::File/"path"> to where unix domain sockets are stored, defaults to the value of the environment
+variable PROXYPASS_UDS_PATH or undef.
 
 =head2 upstream
 
@@ -294,45 +382,85 @@ A hash mapping upstream servers for each handled request L<Mojo::URL/"host_port"
 
 L<Mojolicious::Plugin::ProxyPass> implements the following helpers.
 
-=head2 proxy->jwt_url
+=head2 proxy->error
 
-  $url_str = $app->proxy->jwt_url;
+  # undef
+  $app->proxy->error($code => $message);
 
-A URL with a JWT token that can be used to sign all subsequent transactions.
+Render not_found if $code is 4xx or $message exception if $code is 5xx. Always returns undef.
 
-=head2 proxy->login
+=head2 proxy->jwt
 
-  $c->proxy->login;
+  $jwt = $app->proxy->jwt;
 
-Handle unsigned requests that require it. Meant to be redefined after this plugin is loaded.
+Access the plugin jwt instance.
+
+=head2 proxy->log
+
+  $log = $app->proxy->log(@contexts);
+
+The ProxyPass L<Mojo::Log> instance based on the application log. This is very useful for controlling log levels
+for ProxyPass separately from the application log.
+
+If contexts are provided, these are applied to the L<Mojo::Log> instance. The request_id and ProxyPass authenticated
+ID are always added.
+
+  $log = $app->proxy->log(@contexts);
+
+  $id = $app->proxy->login;
+
+The login ID -- the ProxyPass session value.
+
+Meant to be redefined by the application.
 
 =head2 proxy->pass
 
   $origin_tx = $app->proxy->pass;
 
-Proxy the connection to the L<"upstream"> server and return the response to the client. If a unix domain socket in the
-L<"uds_path"> exists, use it instead of the specified L<"upstream"> server.
+A catch all route for any request method, including websockets. Proxy the connection to the configured L<"upstream">
+server and return the response to the client. If a unix domain socket in the L<"uds_path"> exists, use it instead of
+the specified L<"upstream"> server.
 
-This helper is mostly just logging, but does provide some important benefits:
+proxy->pass creates a catch-call route for requests that require a configured upstream and are first handled by the
+L</"namespace">::L</"controller"> class L</"auth_upstream"> action.
+
+The default L<ProxyPass::Controller::ProxyPass> controller checks that authentication is required for the upstream
+and if not authenticated, is redirected to a login page.
+
+Additionally:
 
   - If the upstream server is configured to require it, the gateway request will call the L<"login"> helper unless the
     request is already signed
   - If the upstream server cannot be determined, ProxyPass is aborted with "Service not available"
   - A signed cookie is added to the gateway response if the upstream server is configured to require it
   - If needed, the gateway transaction is resumed after the origin transaction is finished
-
-=head2 proxy->sign
-
-  $c->proxy->sign($cookie_name, $identifier);
-  $c->proxy->sign($cookie_name);
-
-Sets the identifier for the signed cookie and then stores the session.
+  - Establishes and retains websocket connections if requested by the client
 
 =head2 proxy->upstream
 
   $host_port = $c->proxy->upstream;
 
 Get the L<"upstream"> server for this transaction.
+
+=head1 ROUTES
+
+=head2 proxypass (GET /proxypass)
+
+Route to status action of L</"controller_class">. Stashes the L<Mojo::MemoryMap> object in map.
+
+Defaults to render a JSON response of all current connection IDs.
+
+=head2 proxypass_login (ANY /proxypass/login)
+
+Route to login action of L</"controller_class">, sets the ProxyPass session value to the login ID.
+
+Defaults to rendering the logged_in template if authenticated, login_form otherwise.
+
+=head2 proxypass_logout (ANY /proxypass/logout)
+
+Route to logout action of L</"controller_class">, expires the session.
+
+Defaults to rendering the logged_out template.
 
 =head1 METHODS
 
@@ -347,9 +475,13 @@ Register plugin in L<Mojolicious> application.
 
 =head1 DEBUGGING
 
-=head2 MOJO_PROXY_DEBUG
+=head2 PROXYPASS_DEBUG
 
-Set to a true value to enable gateway and origin request and response logging.
+Set to a true value to enable gateway and origin request and response logging, defaults to false.
+
+=head2 PROXYPASS_LOG_LEVEL
+
+Set the log level for ProxyPass logging, defaults to trace.
 
 =head1 SEE ALSO
 
