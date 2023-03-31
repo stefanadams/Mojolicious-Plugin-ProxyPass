@@ -11,7 +11,7 @@ use ProxyPass::JWT;
 use constant DEBUG => $ENV{PROXYPASS_DEBUG} //= 0;
 use constant LOG_LEVEL => $ENV{PROXYPASS_LOG_LEVEL} //= 'trace';
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 has controller => 'ProxyPass';
 has jwt => sub { ProxyPass::JWT->new };
@@ -165,8 +165,12 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
 
   # Handle static files on behalf of the upstream
   my $key = join '', $c->tx->req->headers->host, $c->tx->req->url->path;
-  if (my ($static_path) = map { $config->{static}->{$_} } grep { $key =~ $_ } keys $config->{static}->%*) {
-    my $static_file = path($static_path, $c->tx->req->url->path);
+  if (($key) = grep { $key =~ $_ } keys $config->{static}->%*) {
+    my $static_path = $config->{static}->{$key};
+    my $key_path_parts  = Mojo::URL->new($key)->path->parts;
+    my $real_path_parts = $c->tx->req->url->path->parts;
+    shift @$real_path_parts for 1..$#$key_path_parts;
+    my $static_file = path($static_path, @$real_path_parts);
     return -e $static_file ? $c->reply->file($static_file) : $c->reply->not_found;
   }
 

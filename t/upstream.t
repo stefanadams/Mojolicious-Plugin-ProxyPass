@@ -82,12 +82,14 @@ my %tests = (
 );
 
 for (sort keys %tests) {
-  my $upstream = $t->app->proxy->upstream(Mojo::URL->new($_));
-  ref $upstream eq 'Mojo::URL' or isa_ok $upstream, 'Mojo::URL' or next;
-  ok $upstream eq $tests{$_}->[0] && $upstream->base eq $tests{$_}->[1],
-    sprintf 'req %s upstream is %s and upstream base is %s', $_, $upstream, $upstream->base and next;
-  is $upstream, $tests{$_}->[0];
-  is $upstream->base, $tests{$_}->[1];
+  subtest "Upstream for $_" => sub {
+    my $upstream = $t->app->proxy->upstream(Mojo::URL->new($_));
+    ref $upstream eq 'Mojo::URL' or isa_ok $upstream, 'Mojo::URL' or next;
+    ok $upstream eq $tests{$_}->[0] && $upstream->base eq $tests{$_}->[1],
+      sprintf 'req %s upstream is %s and upstream base is %s', $_, $upstream, $upstream->base and return;
+    is $upstream, $tests{$_}->[0];
+    is $upstream->base, $tests{$_}->[1];
+  };
 }
 
 done_testing;
