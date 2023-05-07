@@ -24,6 +24,7 @@ sub register ($self, $app, $config) {
   # Initialize plugin
   $self->_initialize($app, $config);
   $app->plugin('HeaderCondition');
+  $app->plugin('ProxyPass::Plugin::CaptureTX');
   $app->hook(before_server_start => sub { _before_server_start($self, @_) });
   $app->hook(before_dispatch => sub { _before_dispatch($self, @_) });
   $app->helper('proxy.error' => \&_error);
