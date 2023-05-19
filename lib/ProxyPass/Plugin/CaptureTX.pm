@@ -13,7 +13,7 @@ sub register {
   my $path = path($conf->{path}) if $conf->{path};
   $self->tx_dir(path($conf->{path})) if $path;
   return unless -d $self->tx_dir;
-  $app->log->debug('Capturing Transactions');
+  $app->log->debug(sprintf 'Capturing Transactions in %s', $self->tx_dir);
   $self->skip_cb($conf->{skip_cb}) if $conf->{skip_cb};
   $app->hook(after_build_tx => sub { $self->_capture($_[1], $_[0]) });
   $app->helper(capture_tx => sub { $self->_capture($_[0]->app, $_[1]) });
@@ -22,9 +22,8 @@ sub register {
 # Capture real requests for replaying later
 # $ nc localhost 3000 < tx_dir/abc123
 sub _capture ($self, $app, $tx) {
-  my $assets = {};
   $tx->on(connection => sub ($tx, $connection) {
-    my $asset = $assets->{$connection} //= Mojo::Asset::File->new(cleanup => 0, path => $self->tx_dir);
+    my $asset = $self->{assets}->{$connection} //= Mojo::Asset::File->new(cleanup => 0, path => $self->tx_dir->child($connection));
     my $stream = Mojo::IOLoop->stream($connection);
     $stream->on(read => sub ($stream, $bytes) {
       return if $self->skip_cb->($app, $tx, $stream, $bytes);
@@ -33,7 +32,7 @@ sub _capture ($self, $app, $tx) {
     });
     $stream->on(close => sub ($tx) {
       $app->log->debug(sprintf '[%s] captured %d-byte tx', $connection, $asset->size);
-      delete $assets->{$connection};
+      delete $self->{assets}->{$connection};
     });
   });
 }
