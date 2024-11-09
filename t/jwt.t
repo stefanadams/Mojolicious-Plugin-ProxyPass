@@ -71,18 +71,13 @@ plugin 'ProxyPass' => {
   },
 };
 
-app->helper('proxy.login' => sub ($c) {
-  my $jwt = $c->param('proxypass') or return;
-  return $c->proxy->jwt->id($jwt);
-});
-
 app->proxy->pass;
 
 subtest 'Various response variants' => sub {
   $t->get_ok('/size/200/2')->status_is(302, 'requires login');
   $t->get_ok('/proxypass/login')->status_is(200, 'redirected to login');
   $t->get_ok('/size/200/2')->status_isnt(200, 'requires login');
-  $t->get_ok('/proxypass/login?proxypass=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJQcm94eVBhc3MiOiJhIiwiZXhwIjoxNjcwODE3NTE2fQ.oIl1alsXTh3-Uag8Q2Nc09V4Tq5EZDpT3bWcDZ4MFbI')->status_is(500, 'failed HS validation');
+  $t->get_ok("/proxypass/login?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJQcm94eVBhc3MiOiJhIiwiZXhwIjoxNjcwODE3NTE2fQ.oIl1alsXTh3-Uag8Q2Nc09V4Tq5EZDpT3bWcDZ4MFbI")->status_is(500, 'failed HS validation');
   $t->get_ok('/size/200/2')->status_isnt(200, 'requires login');
 
   my $token = app->proxy->jwt->token('a');

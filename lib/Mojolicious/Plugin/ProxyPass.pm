@@ -1,6 +1,7 @@
 package Mojolicious::Plugin::ProxyPass;
 use Mojo::Base 'Mojolicious::Plugin', -signatures;
 
+use Mojo::Collection;
 use Mojo::File qw(path tempdir);
 use Mojo::Loader qw(load_class);
 use Mojo::MemoryMap;
@@ -9,9 +10,9 @@ use ProxyPass;
 use ProxyPass::JWT;
 
 use constant DEBUG => $ENV{PROXYPASS_DEBUG} //= 0;
-use constant LOG_LEVEL => $ENV{PROXYPASS_LOG_LEVEL} //= 'trace';
+use constant LOG_LEVEL => $ENV{PROXYPASS_LOG_LEVEL};
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 
 has controller => 'ProxyPass';
 has jwt => sub { ProxyPass::JWT->new };
@@ -39,6 +40,7 @@ sub register ($self, $app, $config) {
   my $pp = $r->under('/proxypass')->to(namespace => $self->namespace, controller => $self->controller, cb => sub { 1 });
   $pp->get('/')->to('#proxypass', map => $self->{map})->name('proxypass');
   $pp->any('/login')->to('#login')->name('proxypass_login');
+  $pp->any('/jwt')->to('#generate_token')->name('proxypass_jwt');
   $pp->any('/logout')->to('#logout')->name('proxypass_logout');
 
   return $self;
@@ -55,9 +57,9 @@ sub _before_server_start ($self, $server, $app) {
   warn sprintf "Unix Domain Socket Path is %s\n", $self->uds_path if DEBUG && $self->uds_path;
 }
 
-sub _catch_all ($self, $c, $req_cb=undef, $res_cb=undef) {
+sub _catch_all ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   my $up = $c->app->routes->under->to(namespace => $self->namespace, controller => $self->controller, action => 'auth_upstream', config => $self->{config});
-  $up->any('/*proxy_pass' => {proxy_pass => ''} => sub { $self->_proxy_pass(shift, $req_cb, $res_cb) })
+  $up->any('/*proxy_pass' => {proxy_pass => ''} => sub { $self->_proxy_pass(shift, $req_cb, $res_cb, $intercept) })
       ->requires('upstream');
 }
 
@@ -128,17 +130,23 @@ sub _log ($c, @contexts) {
     unshift @contexts, $c->req->request_id;
     unshift @contexts, $c->session('ProxyPass') || '?';
     $log = $c->app->log->context(sprintf join(' ', map { '[%s]' } @contexts), @contexts);
-    $log->level(LOG_LEVEL);
+    $log->level(LOG_LEVEL) if LOG_LEVEL;
     $c->stash('proxy_pass.log' => $log);
   }
   return $log;
 }
 
-sub _login ($c) { $c->session('ProxyPass') }
+sub _login ($c) {
+  my $jwt = $c->param('jwt') or return;
+  my $id = $c->proxy->jwt->id($jwt) or return;
+  my $admin = $c->proxy->jwt->admin($jwt);
+  $c->session({ProxyPass => $id, ProxyPassAdmin => $admin});
+  return $id;
+}
 
 sub _memory_map ($self) { $self->{map}->writer->change(sub { $_->{connections}{$$} = [map { {upstream => $_, session => $self->{connections}->{$_}->[0]} } keys $self->{connections}->%*] }) }
 
-sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
+sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $c->ua->cookie_jar->empty;
   $c->inactivity_timeout(300);
   my $id = $c->session('ProxyPass') || _cx($c->tx);
@@ -194,6 +202,8 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
   $or_tx->req->headers->header('X-Forwarded-Host'  => $gw_req_url->host_port);
   $or_tx->req->headers->header('X-Forwarded-Proto' => $gw_req_url->scheme);
   $or_tx->req->headers->header('X-ProxyPass'       => "Request/$id");
+  $or_tx->req->headers->header('X-ProxyPass-ID'    => $c->session('ProxyPass')) if $c->session('ProxyPass');
+  $or_tx->req->headers->header('X-ProxyPass-Admin' => $c->session('ProxyPassAdmin')) if $c->session('ProxyPassAdmin');
   $or_tx->req->headers->header('X-Request-Base'    => $or_req_url->base);
   $or_tx->req->headers->header('Upgrade'           => $gw_req->headers->upgrade) if $gw_req->headers->upgrade;
   $or_tx->req->headers->header('Connection'        => $gw_req->headers->connection) if $gw_req->headers->connection;
@@ -204,6 +214,18 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef) {
   # Log origin request
   _trace($c, 'ProxyPassTX >>> %s', join '', path($or_req_url->host)->basename, $or_req_url->path);
   _debug(or => $or_tx->req);
+
+  # Intercept filtered responses for inspection/modification
+  return if ($intercept || Mojo::Collection->new)->grep(sub { $_->[0]->($c, $or_tx) })->first(sub {
+    my $intercept_cb = $_->[1];
+    $c->ua->start_p($or_tx)->then(sub ($tx) {
+      $c->log->info(sprintf 'Filtering %s', $or_tx->req->url);
+      $c->res->headers->from_hash($tx->res->headers->to_hash);
+      $intercept_cb->($c, $tx);
+    })->catch(sub ($err) {
+      $c->proxy->error(400 => $c->app->mode eq 'development' ? $err : 'Could not connect to backend web service!');
+    });
+  });
 
   # Handle downstream websocket messages
   $gw_c->on(message => sub ($c, $msg) {
@@ -414,15 +436,18 @@ ID are always added.
 
   $log = $app->proxy->log(@contexts);
 
+=head2 proxy->login
+
   $id = $app->proxy->login;
 
-The login ID -- the ProxyPass session value.
-
-Meant to be redefined by the application.
+Meant to be redefined by the application.  Should implement authentication mechanism and verify the submitted values.
+Must set the ProxyPass session value to the login ID. Should set the ProxyPassAdmin session value. Returns the login ID
+if successful, otherwise undef.
 
 =head2 proxy->pass
 
   $origin_tx = $app->proxy->pass;
+  $origin_tx = $app->proxy->pass($req_cb, $res_cb, $intercept_collection);
 
 A catch all route for any request method, including websockets. Proxy the connection to the configured L<"upstream">
 server and return the response to the client. If a unix domain socket in the L<"uds_path"> exists, use it instead of
@@ -443,6 +468,35 @@ Additionally:
   - If needed, the gateway transaction is resumed after the origin transaction is finished
   - Establishes and retains websocket connections if requested by the client
 
+Optional arguments:
+
+=over 4
+
+=item req_cb
+
+  $app->proxy->pass(sub ($c, $or_tx) { $or_tx->req->headers->user_agent('MojoProxy/1.0') });
+
+A callback to modify the origin request before it is sent.
+
+=item res_cb
+
+  $app->proxy->pass(undef, sub ($c, $or_tx) { $or_tx->res->headers->header('X-ProxyPass' => 'Response') });
+
+A callback to modify the gateway response before it is sent.
+
+=item intercept_collection
+
+  $app->proxy->pass(undef, undef, Mojo::Collection->new(
+    [
+      sub ($c, $or_tx) { $or_tx->res->headers->header('X-ProxyPass' => 'Intercept') },
+      sub ($c, $up_tx) { $up_tx->res->headers->header('X-ProxyPass' => 'Intercept') },
+    ]
+  ));
+
+A collection of callbacks to filter or intercept the origin response before it is sent to the gateway response.
+
+=back
+
 =head2 proxy->upstream
 
   $host_port = $c->proxy->upstream;
@@ -456,6 +510,13 @@ Get the L<"upstream"> server for this transaction.
 Route to status action of L</"controller_class">. Stashes the L<Mojo::MemoryMap> object in map.
 
 Defaults to render a JSON response of all current connection IDs.
+
+=head2 proxypass_login (ANY /proxypass/jwt)
+
+Route to generate_token action of L</"controller_class">, available to ProxyPassAdmin sessions to generate additional
+JWTs.
+
+Defaults to rendering the generate_token template if authenticated as ProxyPassAdmin.
 
 =head2 proxypass_login (ANY /proxypass/login)
 

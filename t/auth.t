@@ -59,11 +59,11 @@ plugin 'ProxyPass' => {
   },
 };
 
+# Sample auth override, built-in is based on JWT
 app->helper('proxy.login' => sub ($c) {
-  my $username = $c->param('username');
-  my $password = $c->param('password');
-  return unless $username && $password;
-  return $username if $username eq 'a' && $password eq 'a';
+  my $username = $c->param('username') or return;
+  my $password = $c->param('password') or return;
+  $c->session(ProxyPass => $username) and return $username if $username eq 'a' && $password eq 'a';
 });
 
 app->proxy->pass;

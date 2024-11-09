@@ -7,11 +7,11 @@ has usage       => sub { shift->extract_usage };
 sub run {
   my $self = shift;
 
-  die $self->usage unless @_ == 2;
+  die $self->usage unless @_ >= 2;
 
-  my ($url, $id) = @_;
-  my $jwt = $app->proxy->jwt;
-  my $token = $jwt->token($id, 600);
+  my ($url, $id, $admin, $expires) = @_;
+  my $jwt = $self->app->proxy->jwt;
+  my $token = $jwt->token($id, $admin, $expires||600);
 
   say $jwt->url($url, $token);
 }
@@ -28,7 +28,7 @@ Mojolicious::Command::jwt - Generate ProxyPass JWT
 
   Usage: APPLICATION jwt url username
 
-    mojo jwt http://proxy-url carl
+    mojo jwt http://proxy-url carl [admin] [timeout]
 
   Options:
     -h, --help   Show this summary of available options
