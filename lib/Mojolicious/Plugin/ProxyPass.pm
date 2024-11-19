@@ -6,6 +6,7 @@ use Mojo::File qw(path tempdir);
 use Mojo::Loader qw(load_class);
 use Mojo::MemoryMap;
 use Mojo::URL;
+use Mojo::WebSocket qw(WS_PING);
 use ProxyPass;
 use ProxyPass::JWT;
 
@@ -16,6 +17,7 @@ our $VERSION = '0.07';
 
 has controller => 'ProxyPass';
 has jwt => sub { ProxyPass::JWT->new };
+has log_level => LOG_LEVEL;
 has namespace => 'ProxyPass::Controller';
 has uds_path => sub { $ENV{PROXYPASS_UDS_PATH} ? path($ENV{PROXYPASS_UDS_PATH})->make_path : undef };
 has upstream => sub { {} };
@@ -30,10 +32,13 @@ sub register ($self, $app, $config) {
   $app->hook(before_dispatch => sub { _before_dispatch($self, @_) });
   $app->helper('proxy.error' => \&_error);
   $app->helper('proxy.jwt' => sub { state $jwt = $self->jwt });
-  $app->helper('proxy.log' => \&_log);
+  $app->helper('proxy.log' => sub { _log($self, @_) });
   $app->helper('proxy.login' => \&_login);
   $app->helper('proxy.pass' => sub { _catch_all($self, @_); $app });
   $app->helper('proxy.upstream' => sub { _upstream($self, @_) });
+  $app->sessions->cookie_name('proxypass');
+  $app->secrets($app->config->{proxypass}{secrets} || [__FILE__]);
+  $app->max_request_size($app->config->{proxypass}{max_request_size} || 107374182);
 
   # Setup ProxyPass routing
   my $r = $app->routes->add_condition(upstream => \&_requires_upstream);
@@ -124,13 +129,13 @@ sub _initialize ($self, $app, $config) {
   return $self;
 }
 
-sub _log ($c, @contexts) {
+sub _log ($self, $c, @contexts) {
   my $log = $c->stash('proxy_pass.log');
   if (!$log || @contexts) {
-    unshift @contexts, $c->req->request_id;
     unshift @contexts, $c->session('ProxyPass') || '?';
+    unshift @contexts, $c->req->request_id;
     $log = $c->app->log->context(sprintf join(' ', map { '[%s]' } @contexts), @contexts);
-    $log->level(LOG_LEVEL) if LOG_LEVEL;
+    $log->level($self->log_level) if $self->log_level;
     $c->stash('proxy_pass.log' => $log);
   }
   return $log;
@@ -148,7 +153,8 @@ sub _memory_map ($self) { $self->{map}->writer->change(sub { $_->{connections}{$
 
 sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $c->ua->cookie_jar->empty;
-  $c->inactivity_timeout(300);
+  $c->ua->inactivity_timeout(0);
+  $c->inactivity_timeout(0);
   my $id = $c->session('ProxyPass') || _cx($c->tx);
   my $config = $self->{config};
 
@@ -163,7 +169,7 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $gw_req_url->host or return $c->proxy->error(400 => 'Host missing from HTTP request');
 
   # Log gateway request
-  _trace($c, 'ProxyPassTX  >  %s', $gw_req_url->host_port);
+  _trace($c, 'GWProxyPassTX  >  %s', $gw_req_url->host_port);
   _debug(gw => $gw_tx->req);
 
   # origin (or) is the private intended-destination app server
@@ -184,11 +190,16 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   }
 
   # Build origin transaction
-  my ($or_tx, $agent);
+  my ($or_tx, $agent, $ping);
   if ($gw_tx->is_websocket) {
     $or_req_url->scheme($or_req_url->scheme =~ s/http/ws/r);
-    _trace($c, 'ProxyPassTX ... (%s)', _cx($gw_tx));
+    _trace($c, 'GWProxyPassTX ... (%s)', _cx($gw_tx));
     $or_tx = $c->ua->build_websocket_tx($or_req_url => $or_req_headers->to_hash);
+    # For some reason, the gateway websocket connection keeps timing out at 100s
+    $ping = Mojo::IOLoop->recurring(60 => sub {
+      $gw_tx->send([1, 0, 0, 0, WS_PING, '1']);
+      _trace($c, 'GWProxyPassTX WSP (%s)', _cx($gw_tx));
+    });
     $agent = 'ua';
   }
   else {
@@ -212,7 +223,7 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $req_cb->($c, $or_tx) if ref $req_cb eq 'CODE';
 
   # Log origin request
-  _trace($c, 'ProxyPassTX >>> %s', join '', path($or_req_url->host)->basename, $or_req_url->path);
+  _trace($c, 'GWProxyPassTX >>> %s', join '', path($or_req_url->host)->basename, $or_req_url->path);
   _debug(or => $or_tx->req);
 
   # Intercept filtered responses for inspection/modification
@@ -231,13 +242,14 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $gw_c->on(message => sub ($c, $msg) {
     my $or_ws = $self->{connections}->{$or_tx->connection}->[1];
     return unless $or_ws->is_websocket;
-    _trace($c, 'ProxyPassWS  >  (%s)', _cx($gw_ws));
-    _trace($c, 'ProxyPassWS >>> (%s)', _cx($or_ws));
+    _trace($c, 'GWProxyPassWS  >  (%s)', _cx($gw_ws));
+    _trace($c, 'GWProxyPassWS >>> (%s)', _cx($or_ws));
     $or_ws->send($msg);
   });
   $gw_c->on(finish => sub ($c, $code=undef, $reason=undef) {
     return unless $c->tx->is_websocket;
-    _trace($c, 'ProxyPassWS <x> (%d|%s)', $code, _cx($gw_ws));
+    Mojo::IOLoop->remove($ping) if $ping;
+    _trace($c, 'GWProxyPassWS <x> (%d|%s)', $code, join ' ', grep {$_} _cx($gw_ws), $reason);
     delete $self->{connections}->{$or_tx->connection};
   });
 
@@ -248,22 +260,22 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
     # Start new websocket connection
     my $or_ws = $tx;
     $self->{connections}->{$tx->connection} = [$id, $or_ws];
-    _trace($c, 'ProxyPassWS <=> (%s)', _cx($or_ws));
+    _trace($c, 'ORProxyPassWS <=> (%s)', _cx($or_ws));
     my $stream = Mojo::IOLoop->stream($or_ws->connection // '');
-    $stream->timeout(300) if $stream;
+    $stream->timeout(0) if $stream;
 
     # Handle upstream websocket messages
     $or_ws->on(message => sub ($ws, $msg) {
-      _trace($c, 'ProxyPassWS <<< (%s)', _cx($or_ws));
-      _trace($c, 'ProxyPassWS  <  (%s)', _cx($gw_ws));
+      _trace($c, 'ORProxyPassWS <<< (%s)', _cx($or_ws));
+      _trace($c, 'ORProxyPassWS  <  (%s)', _cx($gw_ws));
       $gw_ws->send($msg);
     });
     $or_ws->on(finish => sub ($ws, $code, $reason) {
-      _trace($c, 'ProxyPassWS <X> (%d|%s)', $code, _cx($or_ws));
+      _trace($c, 'ORProxyPassWS <X> (%d|%s)', $code, join ' ', grep {$_} _cx($or_ws), $reason);
       $gw_ws->finish;
     });
   })->catch(sub ($err) {
-    _trace($c, 'ProxyPassTX <=X %s(%s)', $gw_req_url->host_port, $err);
+    _trace($c, 'GWProxyPassTX <=X %s(%s)', $gw_req_url->host_port, $err);
     my $error = sprintf 'Proxy error connecting to backend %s from %s: %s', $or_req_url->host_port, $gw_req_url->host_port, $err;
     $c->proxy->error(400 => $c->app->mode eq 'development' ? $error : 'Could not connect to backend web service!');
   });
@@ -271,7 +283,7 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   # Modify origin response
   $or_tx->res->content->once(body => sub ($or_content) {
     # Log origin response
-    _trace($c, 'ProxyPassTX <<< %s/%s', _res_code_length($or_tx));
+    _trace($c, 'ORProxyPassTX <<< %s/%s', _res_code_length($or_tx));
     _debug(or => $or_tx->res);
 
     # Add some helper headers
@@ -284,12 +296,12 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
     # Log redirect
     if (my $or_res_location = $or_tx->res->headers->location) {
       $or_res_location = Mojo::URL->new($or_res_location);
-      _trace($c, 'ProxyPassTX <<< (%s)', $or_res_location->host_port);
-      _trace($c, 'ProxyPassTX  <  (%s)', $gw_tx->res->headers->location);
+      _trace($c, 'ORProxyPassTX <<< (%s)', $or_res_location->host_port);
+      _trace($c, 'ORProxyPassTX  <  (%s)', $gw_tx->res->headers->location);
     }
 
     # Log gateway response
-    _trace($c, 'ProxyPassTX %s=> %s/%s', _resume($c, $gw_tx, $or_tx), _res_code_length($gw_tx));
+    _trace($c, 'ORProxyPassTX %s=> %s/%s', _resume($c, $gw_tx, $or_tx), _res_code_length($gw_tx));
     _debug(gw => $gw_tx->res);
   });
 
