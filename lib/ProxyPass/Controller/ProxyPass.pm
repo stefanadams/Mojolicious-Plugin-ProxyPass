@@ -1,6 +1,9 @@
 package ProxyPass::Controller::ProxyPass;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
 
+use Mojo::JSON qw(encode_json decode_json);
+use Mojo::Util qw(b64_decode b64_encode);
+
 has default_url => '/proxypass';
 has url => sub ($self) { $self->param('_URL') || $self->app->config->{proxy_pass}->{default_url} || $self->default_url };
 
@@ -22,6 +25,33 @@ sub generate_token ($self) {
   else {
     $self->render('proxypass/generate_token');
   }
+}
+
+sub idp_auth ($self) {
+  warn $self->app->dumper({body => $self->req->body});
+  my $claims = Mojo::JSON::Pointer->new(decode_json(b64_decode($self->req->body) || '{}'));
+  warn $claims;
+  my $callback = $claims->get('/callback') or return $self->reply->exception('Missing claims callback parameter');
+  my $id = $claims->get('/id') or return $self->reply->exception('Missing claims id parameter');
+  my $email = $claims->get('/email') || 1;
+  if ($email) {
+    $self->log->info(sprintf 'IdP email retrieval successful for %s from %s', $id, $self->tx->req->headers->header('X-Forwarded-For') || $self->tx->remote_address);
+    my $jwt = $self->proxy->jwt->token($id, 0);
+    $callback = Mojo::URL->new($callback)->query(jwt => $jwt);
+    warn $callback;
+    return $self->reply->ok;
+  }
+  else {
+    $self->log->info(sprintf 'IdP email retrieval failed for %s from %s', $id, $self->tx->req->headers->header('X-Forwarded-For') || $self->tx->remote_address);
+    return $self->reply->exception('Email claim missing from identity provider');
+  }
+}
+
+sub idp_verify ($self) {
+  return $self->reply->ok if $self->session('id');
+  my $jwt = $self->param('jwt') or return $self->reply->exception('Bad Request: jwt parameter missing');
+  my $id = $self->proxy->jwt->id($jwt) or return $self->reply->exception('Unauthorized: invalid token');
+  $self->session(id => $id)->reply->ok;
 }
 
 sub login ($self) {
@@ -59,7 +89,7 @@ __DATA__
 </p>
 <p>
   %= label_for admin => 'Can generate JWTs?'
-  %= checkbox 'admin'
+  %= check_box 'admin'
 </p>
 <p>
   %= submit_button

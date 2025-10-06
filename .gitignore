@@ -14,3 +14,4 @@
 /local
 /log
 *.pid
+*.tar.gz

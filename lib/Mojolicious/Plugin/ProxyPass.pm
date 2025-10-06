@@ -3,6 +3,7 @@ use Mojo::Base 'Mojolicious::Plugin', -signatures;
 
 use Mojo::Collection;
 use Mojo::File qw(path tempdir);
+use Mojo::IOLoop;
 use Mojo::Loader qw(load_class);
 use Mojo::MemoryMap;
 use Mojo::URL;
@@ -13,7 +14,7 @@ use ProxyPass::JWT;
 use constant DEBUG => $ENV{PROXYPASS_DEBUG} //= 0;
 use constant LOG_LEVEL => $ENV{PROXYPASS_LOG_LEVEL};
 
-our $VERSION = '0.07';
+our $VERSION = '0.08';
 
 has controller => 'ProxyPass';
 has jwt => sub { ProxyPass::JWT->new };
@@ -36,9 +37,16 @@ sub register ($self, $app, $config) {
   $app->helper('proxy.login' => \&_login);
   $app->helper('proxy.pass' => sub { _catch_all($self, @_); $app });
   $app->helper('proxy.upstream' => sub { _upstream($self, @_) });
+  $app->helper('reply.close' => \&_close);
+  $app->helper('reply.ok' => \&_ok);
   $app->sessions->cookie_name('proxypass');
   $app->secrets($app->config->{proxypass}{secrets} || [__FILE__]);
   $app->max_request_size($app->config->{proxypass}{max_request_size} || 107374182);
+
+  # Setup IdP routing
+  my $idp = $app->routes->under('/idp')->to(namespace => $self->namespace, controller => $self->controller, cb => sub { 1 });
+  $idp->post('/auth')->to('#idp_auth')->name('idp_auth');
+  $idp->post('/verify')->to('#idp_verify')->name('idp_verify');
 
   # Setup ProxyPass routing
   my $r = $app->routes->add_condition(upstream => \&_requires_upstream);
@@ -76,6 +84,11 @@ sub _config ($self, $app_config, $plugin_config) {
 
 sub _cx ($tx) { ref $tx ? substr($tx->connection, 0, 7) : '-' }
 
+sub _close ($c) {
+  $c->rendered(503);
+  Mojo::IOLoop->stream($c->tx->connection)->close;
+}
+
 sub _debug ($label, $msg) {
   return unless DEBUG;
   my ($msg_type) = ((ref $msg) =~ /^Mojo::Message::(\w+)$/);
@@ -104,6 +117,7 @@ sub _error ($c, $status, $message) {
   return if $status == 100;
   if ($status =~ /^4/) {
     $c->reply->not_found;
+    # $c->reply->close;
   }
   elsif ($status =~ /^5/) {
     $c->reply->exception($message);
@@ -150,6 +164,8 @@ sub _login ($c) {
 }
 
 sub _memory_map ($self) { $self->{map}->writer->change(sub { $_->{connections}{$$} = [map { {upstream => $_, session => $self->{connections}->{$_}->[0]} } keys $self->{connections}->%*] }) }
+
+sub _ok { shift->render(data => '', status =>200) };
 
 sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $c->ua->cookie_jar->empty;
