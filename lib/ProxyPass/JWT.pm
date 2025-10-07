@@ -3,6 +3,7 @@ use Mojo::Base -base, -signatures;
 
 use Mojo::JWT;
 
+has claims      => sub { {} };
 has jwt_secret  => __FILE__;
 has jwt_timeout => 600;
 has jwt         => sub ($self) { Mojo::JWT->new(secret => $self->jwt_secret) };
@@ -15,7 +16,7 @@ sub id ($self, $token) { $self->jwt->decode($token)->{ProxyPass} }
 
 sub token ($self, $id, $admin=0, $jwt_timeout=undef) {
   my $expires = time + ($jwt_timeout // $self->jwt_timeout);
-  my $claims  = {ProxyPass => $id, ProxyPassAdmin => $admin};
+  my $claims  = {$self->claims->%*, ProxyPass => $id, ProxyPassAdmin => $admin};
 
   return $self->jwt->expires($expires)->claims($claims)->encode;
 }

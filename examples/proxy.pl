@@ -5,7 +5,10 @@ use Mojolicious::Lite -signatures;
 app->session->default_expiration(86_400 * 365);
 
 plugin 'ProxyPass' => {
-  auth_upstream => ['127.0.0.1:3001'],
+  auth_upstream => [
+    '127.0.0.1:3001',
+    '/data/unixsockets/example.com',
+  ],
   uds_path => '',
   upstream => {
     '127.0.0.1' => '127.0.0.1:3001', # requires auth

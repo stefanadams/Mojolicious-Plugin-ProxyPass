@@ -54,6 +54,8 @@ sub register ($self, $app, $config) {
   $pp->get('/')->to('#proxypass', map => $self->{map})->name('proxypass');
   $pp->any('/login')->to('#login')->name('proxypass_login');
   $pp->any('/jwt')->to('#generate_token')->name('proxypass_jwt');
+  $pp->any('/jwt/verify')->to('#verify_token')->name('proxypass_jwt_verify');
+  $pp->any('/idp')->to('#idp')->name('proxypass_idp');
   $pp->any('/logout')->to('#logout')->name('proxypass_logout');
 
   return $self;
