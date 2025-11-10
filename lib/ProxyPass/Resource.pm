@@ -4,9 +4,11 @@ use Mojo::Base -base, -signatures;
 use Mojo::ByteStream qw(b);
 use Mojo::File qw(path);
 use Mojo::URL;
+use Mojo::Util qw(encode);
 
-use constant DEBUG => $ENV{MOJO_PROXY_DEBUG} //= 0;
+use constant DEBUG => $ENV{PROXYPASS_DEBUG} //= 0;
 
+has args => sub { [] };
 has [qw(uds uds_path)];
 
 sub base ($self) {
@@ -33,8 +35,10 @@ sub new {
     $self->upstream($self->_upstream_uds);
   }
   else {
+    splice @_, 1, 1, ref $_[1] eq 'ARRAY' ? @{$_[1]} : ($_[1]);
     $self->downstream(_url($_[0]));
-    $self->upstream(_url($_[1]));
+    $self->upstream(_url($_[1]))->args([@_[2..$#_]]);
+    warn encode 'UTF-8', sprintf "%s(↓) => %s(↑%s)\n", $_[0], $_[1], $_[2] ? '|' . join(', ', @_[2..$#_]) : '' if @_ && DEBUG;
   }
   return $self;
 }

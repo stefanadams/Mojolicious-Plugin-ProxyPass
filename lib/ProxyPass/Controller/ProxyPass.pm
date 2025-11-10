@@ -11,7 +11,10 @@ has url => sub ($self) { Mojo::URL->new($self->param('_URL') || $self->app->conf
 sub auth_upstream ($self) {
   my $upstream = $self->proxy->upstream;
   my $auth_upstream = $self->stash->{config}->{auth_upstream} || [];
-  return 1 unless grep { $_ eq $upstream->host_port } @$auth_upstream;
+  ($auth_upstream) = grep { $_->url eq $upstream->url->host_port } map { ProxyPass::AuthUpstream->new($_) } @$auth_upstream;
+  $self->stash('proxypass.authupstream' => $auth_upstream);
+  return 1 unless $auth_upstream;
+  $self->log->trace(sprintf 'auth_upstream %s%s', $auth_upstream, @$auth_upstream ? join ' ', ' args:', @$auth_upstream : '');
   $self->log->info(sprintf '[auth] [%s] %s', $self->session('ProxyPass'), $self->req->url->path) and return 1 if $self->session('ProxyPass');
   $self->redirect_to($self->url_for('proxypass_login')->query(_URL => $self->req->url->to_abs->to_string));
   return undef;
@@ -29,8 +32,8 @@ sub generate_token ($self) {
 }
 
 sub idp ($self) {
-  $self->proxy->login or return $self->reply->exception('Unauthorized: not logged in');
-  my $url = $self->param('url') || $self->req->headers->referrer or return $self->reply->exception('Bad Request: missing url parameter');
+  $self->proxy->login or return $self->reply->text_error(401 => 'Unauthorized: not logged in');
+  my $url = $self->param('url') || $self->req->headers->referrer or return $self->reply->text_error(400 => 'Bad Request: missing url parameter');
   $url = Mojo::URL->new($url);
   my $claims = {
     id => $self->session('ProxyPass') || 'anonymous',
@@ -70,9 +73,9 @@ sub idp_verify ($self) {
 
 sub login ($self) {
   my $url = $self->url;
-  my $redirect = $self->url_for('proxypass_logout')->query(_URL => $url);
+  my $logout = $self->url_for('proxypass_logout')->query(_URL => $url);
   if (my $id = $self->proxy->login) {
-    $self->render('proxypass/logged_in', id => $id, url => $url, logout => $redirect);
+    $self->render('proxypass/logged_in', id => $id, url => $url, logout => $logout);
   }
   else {
     $self->render('proxypass/login_form', url => $url);

@@ -7,6 +7,7 @@ use Mojo::IOLoop;
 use Mojo::Loader qw(load_class);
 use Mojo::MemoryMap;
 use Mojo::URL;
+use Mojo::Util qw(sha1_sum);
 use Mojo::WebSocket qw(WS_PING);
 use ProxyPass;
 use ProxyPass::JWT;
@@ -39,6 +40,7 @@ sub register ($self, $app, $config) {
   $app->helper('proxy.upstream' => sub { _upstream($self, @_) });
   $app->helper('reply.close' => \&_close);
   $app->helper('reply.ok' => \&_ok);
+  $app->helper('reply.text_error' => sub ($c, $status=500, $msg='') { $c->render(text => $msg, status => $status, exception => Mojo::Exception->new($msg)) });
   $app->sessions->cookie_name('proxypass');
   $app->secrets($app->config->{proxypass}{secrets} || [__FILE__]);
   $app->max_request_size($app->config->{proxypass}{max_request_size} || 107374182);
@@ -58,6 +60,11 @@ sub register ($self, $app, $config) {
   $pp->any('/idp')->to('#idp')->name('proxypass_idp');
   $pp->any('/logout')->to('#logout')->name('proxypass_logout');
 
+  $app->hook(before_server_start => sub ($server, $app) {
+    $app->proxy->log->debug(sprintf 'Mojolicious::Plugin::ProxyPass v%s registered', $VERSION);
+    $app->proxy->log->debug(sprintf 'enable PROXYPASS_DEBUG for additional debugging') unless DEBUG;
+  });
+
   return $self;
 }
 
@@ -75,7 +82,7 @@ sub _before_server_start ($self, $server, $app) {
 sub _catch_all ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   my $up = $c->app->routes->under->to(namespace => $self->namespace, controller => $self->controller, action => 'auth_upstream', config => $self->{config});
   $up->any('/*proxy_pass' => {proxy_pass => ''} => sub { $self->_proxy_pass(shift, $req_cb, $res_cb, $intercept) })
-      ->requires('upstream');
+      ->requires('upstream')->name('proxy_pass');
 }
 
 sub _config ($self, $app_config, $plugin_config) {
@@ -146,13 +153,14 @@ sub _initialize ($self, $app, $config) {
 }
 
 sub _log ($self, $c, @contexts) {
-  my $log = $c->stash('proxy_pass.log');
+  my $log = $c->stash('proxypass.log');
   if (!$log || @contexts) {
     unshift @contexts, $c->session('ProxyPass') || '?';
-    unshift @contexts, $c->req->request_id;
+    unshift @contexts, 'PP-'.($c->tx->remote_port ? $c->req->request_id : unpack 'H*', pack 'N', 0+$self);
+    unshift @contexts, $c->tx->remote_address if $c->tx->remote_address;
     $log = $c->app->log->context(sprintf join(' ', map { '[%s]' } @contexts), @contexts);
     $log->level($self->log_level) if $self->log_level;
-    $c->stash('proxy_pass.log' => $log);
+    $c->stash('proxypass.log' => $log);
   }
   return $log;
 }
@@ -167,7 +175,7 @@ sub _login ($c) {
 
 sub _memory_map ($self) { $self->{map}->writer->change(sub { $_->{connections}{$$} = [map { {upstream => $_, session => $self->{connections}->{$_}->[0]} } keys $self->{connections}->%*] }) }
 
-sub _ok { shift->render(data => '', status =>200) };
+sub _ok { shift->render(data => '', status => 200) };
 
 sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $c->ua->cookie_jar->empty;
@@ -191,9 +199,11 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   _debug(gw => $gw_tx->req);
 
   # origin (or) is the private intended-destination app server
-  my $or_req_headers = $gw_req->headers->clone->dehop;
-  my $or_req_method  = $gw_req_method;
-  my $or_req_url     = $c->proxy->upstream;
+  my $or_req_headers  = $gw_req->headers->clone->dehop;
+  my $or_req_method   = $gw_req_method;
+  my $or_req_upstream = $c->proxy->upstream;
+  my $or_req_url      = $or_req_upstream->url;
+  my $or_req_args     = $or_req_upstream->args;
   $or_req_url->host or return $c->proxy->error(400 => sprintf 'Upstream for %s not found', $gw_req_url->host_port);
 
   # Handle static files on behalf of the upstream
@@ -231,7 +241,7 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $or_tx->req->headers->header('X-Forwarded-Host'  => $gw_req_url->host_port);
   $or_tx->req->headers->header('X-Forwarded-Proto' => $gw_req_url->scheme);
   $or_tx->req->headers->header('X-ProxyPass'       => "Request/$id");
-  $or_tx->req->headers->header('X-ProxyPass-ID'    => $c->session('ProxyPass')) if $c->session('ProxyPass');
+  $or_tx->req->headers->header('X-ProxyPass-Id'    => $c->session('ProxyPass')) if $c->session('ProxyPass');
   $or_tx->req->headers->header('X-ProxyPass-Admin' => $c->session('ProxyPassAdmin')) if $c->session('ProxyPassAdmin');
   $or_tx->req->headers->header('X-Request-Base'    => $or_req_url->base);
   $or_tx->req->headers->header('Upgrade'           => $gw_req->headers->upgrade) if $gw_req->headers->upgrade;
@@ -248,7 +258,7 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   return if ($intercept || Mojo::Collection->new)->grep(sub { $_->[0]->($c, $or_tx) })->first(sub {
     my $intercept_cb = $_->[1];
     $c->ua->start_p($or_tx)->then(sub ($tx) {
-      $c->log->info(sprintf 'Filtering %s', $or_tx->req->url);
+      $c->proxy->log->info(sprintf 'Filtering %s', $or_tx->req->url);
       $c->res->headers->from_hash($tx->res->headers->to_hash);
       $intercept_cb->($c, $tx);
     })->catch(sub ($err) {
@@ -358,14 +368,43 @@ sub _trace {
 
 sub _upstream ($self, $c, $url=undef) {
   $url ||= $c->tx->req->url;
-  my $upstream = $c->stash("proxy.upstream.$url");
+  my $key = substr(sha1_sum($url->to_abs), 0, 8);
+  my $upstream = $c->stash("proxy.upstream.$key");
   return $upstream if $upstream;
-  my $proxypass = ProxyPass->new(uds_path => $self->uds_path, config => $self->upstream)->find($url)->first or return;
-  $upstream = $proxypass->proxypass($url);
-  $c->proxy->log->trace(sprintf 'configuration for upstream %s found: %s', $url, $upstream) if DEBUG;
-  $c->stash("proxy.upstream.$url" => $upstream);
+  my $pp_resource = ProxyPass->new(uds_path => $self->uds_path, config => $self->upstream)->find($url)->first or return;
+  $upstream = ProxyPass::Upstream->new($pp_resource->proxypass($url), $pp_resource->args->@*);
+  $c->proxy->log->trace(sprintf 'configuration for upstream %s found: %s', $url->to_abs, $upstream);
+  $c->stash("proxy.upstream.$key" => $upstream);
   return $upstream;
 }
+
+package ProxyPass::Xstream;
+use Mojo::Base -base;
+use overload 'nomethod' => 'url', '@{}' => sub { shift->to_array }, '""' => sub { shift->to_string }, fallback => 1;
+
+use Mojo::URL;
+
+has args => sub { [] };
+has url => sub { Mojo::URL->new };
+
+sub new {
+  my $self = shift->SUPER::new;
+  @_ = ref $_[0] eq 'ARRAY' ? @$_ : @_;
+  $self->url(shift)->args([@_]);
+  return $self;
+}
+
+sub to_array { shift->args }
+sub to_string { shift->url }
+
+package ProxyPass::AuthUpstream;
+use Mojo::Base 'ProxyPass::Xstream';
+
+package ProxyPass::Downstream;
+use Mojo::Base 'ProxyPass::Xstream';
+
+package ProxyPass::Upstream;
+use Mojo::Base 'ProxyPass::Xstream';
 
 1;
 
@@ -382,13 +421,17 @@ Mojolicious::Plugin::ProxyPass - Mojolicious Plugin to provide provide reverse p
 
   # Mojolicious::Lite
   plugin 'ProxyPass' => {
-    auth_upstream => ['127.0.0.1:3000'],
+    auth_upstream => [
+      '127.0.0.1:3000',
+      ['127.0.0.2:3000', 'auth_arg_1', 'auth_arg_n'],
+    ],
     static => {
       '127.0.0.1/path' => '/static/path',
     },
     uds_path => tempdir,
     upstream => {
-      '127.0.0.1' => '127.0.0.1:3000'
+      '127.0.0.1' => '127.0.0.1:3000',
+      '127.0.0.2' => ['127.0.0.2:3000', 'up_arg_1', 'up_arg_n'],
     },
   };
 
@@ -512,6 +555,7 @@ A callback to modify the origin request before it is sent.
 =item res_cb
 
   $app->proxy->pass(undef, sub ($c, $or_tx) { $or_tx->res->headers->header('X-ProxyPass' => 'Response') });
+  # TODO: example to modify the response body, if possible
 
 A callback to modify the gateway response before it is sent.
 
@@ -523,6 +567,8 @@ A callback to modify the gateway response before it is sent.
       sub ($c, $up_tx) { $up_tx->res->headers->header('X-ProxyPass' => 'Intercept') },
     ]
   ));
+  # TODO: examples to show filtering versus intercepting
+  # TODO: examples to show use of $or_tx versus $up_tx
 
 A collection of callbacks to filter or intercept the origin response before it is sent to the gateway response.
 

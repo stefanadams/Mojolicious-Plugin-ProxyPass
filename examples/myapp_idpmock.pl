@@ -3,12 +3,10 @@ use Mojolicious::Lite -signatures, -async_await;
 
 use Mojo::JSON qw(encode_json decode_json);
 use Mojo::Util qw(b64_decode b64_encode);
+use ProxyPass::JWT;
 
-plugin 'Config' => {default => {idp => $ENV{IDP_URL}}};
+plugin 'Config' => {default => {idp => '/idp/'}};
 
-hook 'before_dispatch' => sub ($c) {
-  warn $c->req->headers->to_string."\n";
-};
 hook 'after_dispatch' => sub ($c) {
   $c->res->headers->header('X-Set-Cookie-Session' => encode_json($c->session)) if keys $c->session->%*;
   $c->log->info(sprintf '[%d] [%s] %s (%s log)', $c->res->code, $c->username, $c->req->url->path, $c->stash('mock') // 'Application');
@@ -19,41 +17,37 @@ helper 'claims' => sub ($c, $val) {
     ? b64_encode(encode_json($val), '')
     : Mojo::JSON::Pointer->new(decode_json(b64_decode($val) || '{}'))
 };
+helper 'jwt' => sub { state $jwt = ProxyPass::JWT->new(secret => shift->app->secrets->[0]) };
 helper 'reply.ok' => sub { shift->render(data => '', status => 204) };
-helper 'reply.unauthorized' => sub ($c, $message=undef) {
-  $c->render(template => 'unauthorized', message => $message, status => 401);
+helper 'reply.idp' => sub ($c) { $c->render(text => $c->jwt->token($c->stash('ProxyPass'))) };
+helper 'reply.jwt' => sub ($c, $claims) { $c->render(text => $c->jwt->token($c->claims($claims))) };
+helper 'reply.unauthorized' => sub ($c) {
+  $c->render(template => 'unauthorized', status => 401);
 };
 helper 'username' => sub ($c) {
-  my $username = $c->param('username') || $c->req->headers->header('X-ProxyPass-Id');
+  my $username = $c->param('username');
   $c->session('ProxyPass') || $c->stash('ProxyPass') || ($username ? "!$username" : 'anonymous');
 };
 
-helper 'idp.url' => sub ($c, $path) { Mojo::URL->new($c->config('idp'))->clone->path("/proxypass/$path") };
+helper 'idp.url' => sub ($c, $path) { Mojo::URL->new($c->config('idp'))->clone->path($path) };
 helper 'idp.auth_p' => sub ($c, $proxy_pass, $url) {
-  $c->ua->insecure(1)->post_p($c->idp->url('idp') => $c->claims({url => $url, ProxyPass => $proxy_pass}))->then(sub ($tx) {
-    warn $tx->res->body;
-    warn $tx->res->code;
-    warn $tx->result->is_success;
-    warn $tx->result->is_error;
-    $c->stash(error => join ' ', $tx->result->error->%*) and return unless $tx->result->is_success;
+  $c->ua->post_p($c->idp->url('auth/')->path($c->param('force')//'') => $c->claims({url => $url, ProxyPass => $proxy_pass}))->then(sub ($tx) {
+    die 'Unauthorized: invalid ProxyPass' unless $tx->result->is_success;
   });
 };
 helper 'idp.verify_p' => sub ($c) {
   return Mojo::Promise->new->resolve if $c->session('ProxyPass');
   return Mojo::Promise->new->reject('missing idp') unless my $idp = $c->param('idp') || $c->cookie('idp');
-  $c->ua->insecure(1)->post_p($c->idp->url('jwt/verify') => $idp)->then(sub ($tx) {
+  $c->ua->post_p($c->idp->url('verify/')->path($c->param('force')//'') => $idp)->then(sub ($tx) {
     die 'Unauthorized: invalid idp jwt' unless $tx->result->is_success;
-    warn $tx->res->body;
-    $c->log->info(123);
-    # $c->session($c->jwt->decode($idp)); # The application session cookie; unique to the application (can this session cookie be shared across multiple apps?)
-    # $c->cookie(idp => $idp); # The identity provider session cookie; unique to the application (can this session cookie be shared across multiple apps? can it be renewed?)
+    $c->session($c->jwt->decode($idp)); # The application session cookie; unique to the application (can this session cookie be shared across multiple apps?)
+    $c->cookie(idp => $idp); # The identity provider session cookie; unique to the application (can this session cookie be shared across multiple apps? can it be renewed?)
   });
 };
 
 # Application Protected routes
 group {
   under '/protected' => sub ($c) {
-    $c->render_later;
     $c->idp->verify_p->then(sub {
       $c->continue;
     })->catch(sub ($err) {
@@ -75,12 +69,32 @@ group {
 
   any '/login/:username' => {username => ''} => sub ($c) {
     $c->render_later;
-    $c->idp->auth_p($c->param('username') || $c->req->params->param('username'), $c->param('url') || $c->flash('url'))->then(sub {
-      $c->reply->unauthorized($c->stash('error'));
+    $c->idp->auth_p($c->param('username'), $c->param('url') || $c->flash('url'))->then(sub {
+      $c->reply->unauthorized;
     })->catch(sub ($err) {
       $c->reply->exception($err);
     });
   } => 'login';
+};
+
+# Mock the remote Identity Provider
+group {
+  under '/idp' => {mock => 'Identity Provider'};
+
+  post '/auth/:force' => {force => 1} => sub ($c) {
+    $c->stash($c->claims($c->req->body)->data);
+    return $c->reply->exception(sprintf 'Cannot find ID: %s', $c->stash('ProxyPass')) unless $c->param('force') && $c->stash('ProxyPass');
+    $c->log->trace(sprintf 'IdP authentication for %s', $c->stash('ProxyPass'));
+    $c->log->debug(sprintf 'User to click: %s', Mojo::URL->new($c->stash('url'))->query(idp => $c->jwt->token($c->stash('ProxyPass'))));
+    $c->reply->ok;
+  } => 'idp_auth';
+
+  post '/verify/:force' => {force => 1} => sub ($c) {
+    $c->stash($c->jwt->decode($c->req->body));
+    return $c->reply->exception(sprintf 'Cannot find ProxyPass: %s', $c->stash('ProxyPass')) unless $c->param('force') && $c->stash('ProxyPass');
+    $c->log->trace(sprintf 'IdP verified for %s', $c->stash('ProxyPass'));
+    $c->reply->idp;
+  } => 'idp_verify';
 };
 
 app->start;
@@ -163,11 +177,9 @@ __DATA__
 % title 'Unauthorized';
 % if (param 'username') {
   <h1>Check your email</h1>
-  <p>This app sent your username to the IdP which will have sent you an email to confirm your identity if you are not already logged in to the IdP.<p>
   <p>Check your email for a link to log in.</p>
 % } else {
   <h1>Unauthorized</h1>
-  <p><%= stash 'message' %></p>
   <p>You must be logged in to access this page.</p>
   %= form_for 'login' => (method => 'POST') => begin
   %= hidden_field 'url' => $c->req->url->to_abs->to_string
