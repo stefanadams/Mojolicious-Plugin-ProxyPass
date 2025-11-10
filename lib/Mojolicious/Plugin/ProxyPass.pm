@@ -187,7 +187,7 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $gw_req_url->host or return $c->proxy->error(400 => 'Host missing from HTTP request');
 
   # Log gateway request
-  _trace($c, 'GWProxyPassTX  >  %s', $gw_req_url->host_port);
+  _trace($c, 'GWProxyPassTX  >  %s://%s', $gw_req_url->scheme, $gw_req_url->host_port);
   _debug(gw => $gw_tx->req);
 
   # origin (or) is the private intended-destination app server
@@ -221,7 +221,7 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
     $agent = 'ua';
   }
   else {
-    $or_tx = $c->ua->build_tx($or_req_method => $or_req_url => $or_req_headers->to_hash);
+    $or_tx = $c->ua->insecure(1)->build_tx($or_req_method => $or_req_url => $or_req_headers->to_hash);
     $agent = 'proxy';
   }
 
@@ -241,7 +241,7 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
   $req_cb->($c, $or_tx) if ref $req_cb eq 'CODE';
 
   # Log origin request
-  _trace($c, 'GWProxyPassTX >>> %s', join '', path($or_req_url->host)->basename, $or_req_url->path);
+  _trace($c, 'GWProxyPassTX >>> %s://%s%s', $or_req_url->scheme, $or_req_url->host_port, $or_req_url->path);
   _debug(or => $or_tx->req);
 
   # Intercept filtered responses for inspection/modification
@@ -293,8 +293,9 @@ sub _proxy_pass ($self, $c, $req_cb=undef, $res_cb=undef, $intercept=undef) {
       $gw_ws->finish;
     });
   })->catch(sub ($err) {
-    _trace($c, 'GWProxyPassTX <=X %s(%s)', $gw_req_url->host_port, $err);
-    my $error = sprintf 'Proxy error connecting to backend %s from %s: %s', $or_req_url->host_port, $gw_req_url->host_port, $err;
+    $err=~s/\s*$//;
+    _trace($c, 'GWProxyPassTX <=X %s://%s(%s)', $gw_req_url->scheme, $gw_req_url->host_port, $err);
+    my $error = sprintf 'Proxy error connecting to backend %s://%s from %s://%s: %s', $or_req_url->scheme, $or_req_url->host_port, $gw_req_url->scheme, $gw_req_url->host_port, $err;
     $c->proxy->error(400 => $c->app->mode eq 'development' ? $error : 'Could not connect to backend web service!');
   });
 

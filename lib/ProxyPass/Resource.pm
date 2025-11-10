@@ -7,7 +7,6 @@ use Mojo::URL;
 
 use constant DEBUG => $ENV{MOJO_PROXY_DEBUG} //= 0;
 
-has no_https => 1;
 has [qw(uds uds_path)];
 
 sub base ($self) {
@@ -57,7 +56,6 @@ sub upstream {
 sub _fix_scheme ($self, $url) {
   $_->scheme($url->to_abs->scheme || 'http') unless $_->scheme;
   $_->{scheme}.='+unix' if $self->uds && $_->{scheme} !~ /\+unix/;
-  $_->{scheme} =~ s/https/http/ if $self->no_https;
   return $_;
 }
 
